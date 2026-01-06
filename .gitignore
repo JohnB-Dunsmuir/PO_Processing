@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Logs & outputs
+00_Logs/
+05_Todays_Output/
+06_Historic_Output_Files/
+02_Parsed_Data/
+Parsed_PO_Lines.xlsx
+Parsed_PO_Lines2.xlsx
+*.log
+
+# Runtime inputs (DO NOT VERSION)
+01_PDFs/
+New PDF's/
+
+# Archives / backups / history (DO NOT VERSION)
+04_Archive/
+PO_Processing_BACKUPS/
+test PDFs/
+
+# Master data (runtime, not source code)
+03_Master_Data/
+!03_Master_Data/_system/
+!03_Master_Data/_system/**
+
+# Debug & scratch
+debug_*.csv
+debug_*.py
+reset_pos*.py
+
+# Evaluation / experiments (DO NOT VERSION)
+evaluation stuff/
+*.xlsx
+*.png
+
+# OS
+.DS_Store
+Thumbs.db
