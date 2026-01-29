@@ -1,159 +1,184 @@
 import re
+from typing import Dict, List, Any, Optional
 
-# ---------------------------------------------------------------------------
-# DETECTION
-# ---------------------------------------------------------------------------
 
 def detect_sp_power_systems(text: str) -> bool:
-    """
-    Detect Scottish Power / SP Power Systems POs.
-    """
     if not text:
         return False
-
-    t = text.lower()
-    triggers = [
-        "scottishpower",
-        "sp energy networks",
-        "call-off order",
-        "sp distribution plc",
-        "framework agreement ref",
-        "4507",   # many SP orders begin 4507xxxxxx
-    ]
-    return any(trig in t for trig in triggers)
+    t = text.upper()
+    return ("SP DISTRIBUTION PLC" in t) or ("SCOTTISHPOWER" in t) or ("CALL-OFF ORDER" in t)
 
 
-# ---------------------------------------------------------------------------
-# HEADER EXTRACTION
-# ---------------------------------------------------------------------------
-
-def _extract_po_number(text: str) -> str:
-    # Ref.: 4507111244
-    m = re.search(r"Ref\.:?\s*([0-9]+)", text, flags=re.I)
-    return m.group(1) if m else ""
+REQUIRED_HEADER_KEYS = ["po_number", "po_date", "customer_name", "buyer", "delivery_address"]
 
 
-def _extract_po_date(text: str) -> str:
-    # Date: 12.05.2025
-    m = re.search(r"Date[: ]+(\d{2}\.\d{2}\.\d{4})", text, flags=re.I)
-    return m.group(1) if m else ""
+def _nf(v: Optional[str]) -> str:
+    if v is None:
+        return "Not found"
+    s = str(v).strip()
+    return s if s else "Not found"
 
 
-def _extract_buyer(text: str) -> str:
-    # Manager ALISON BRYCE
-    m = re.search(r"Manager\s+([A-Za-z ]+)", text, flags=re.I)
-    return m.group(1).strip().title() if m else ""
+def _clean_ws(s: Optional[str]) -> str:
+    if not s:
+        return "Not found"
+    return " ".join(str(s).split()).strip()
 
 
-def _extract_delivery_address(text: str) -> str:
+def _find_first(patterns, text: str, flags=0) -> Optional[str]:
+    for pat in patterns:
+        m = re.search(pat, text, flags)
+        if m:
+            return m.group(m.lastindex).strip() if m.lastindex else m.group(0).strip()
+    return None
+
+
+def _norm_num(x: str) -> str:
+    if not x:
+        return "Not found"
+    s = x.strip().replace(" ", "")
+    # 1,378.37 -> 1378.37
+    if re.match(r"^\d{1,3}(?:,\d{3})+(?:\.\d+)?$", s):
+        s = s.replace(",", "")
+        return s
+    # 1.378,37 -> 1378.37
+    if re.match(r"^\d{1,3}(?:\.\d{3})+(?:,\d+)?$", s):
+        s = s.replace(".", "").replace(",", ".")
+        return s
+    return s.replace(",", ".")
+
+
+def _parse_lines(text: str) -> List[Dict[str, Any]]:
     """
-    Extract delivery block under "SHIP TO LOCATION".
-    If missing, use SP Distribution PLC headquarters.
+    Typical SP call-off order:
+      Item Code Quantity / Unit Unit price Base Quantity Amount
+      00010 JT BRANCH TRANSITION ...
+      ...
+      00010 30980279 5 ST 1,378.37 6,891.85
+    We merge:
+      - item_no = 00010 (or as printed)
+      - te_part_number = numeric item code (e.g., 30980279) if present
+      - description = text between the item header line and the numeric detail line (best-effort)
+      - quantity, uom from detail line
     """
-    m = re.search(
-        r"SHIP TO LOCATION\s*([\s\S]*?)Delivery date",
-        text,
-        flags=re.I
+    rows: List[Dict[str, Any]] = []
+
+    # Build a map of item_no -> description block
+    desc_map = {}
+
+    # Find lines that look like: "00010 JT BRANCH TRANSITION ..."
+    header_item_pat = re.compile(r"^\s*(\d{5})\s+([A-Z].+)$", re.IGNORECASE | re.MULTILINE)
+    for m in header_item_pat.finditer(text):
+        item = m.group(1).strip()
+        rest = m.group(2).strip()
+
+        # collect subsequent lines until we hit a detail numeric line or Total/FRAMEWORK section
+        tail = text[m.end():]
+        stop = re.search(r"\n\s*\d{5}\s+\d{5,}\s+\d", tail)  # next detail line
+        stop2 = re.search(r"\n\s*Total\b|\n\s*FRAMEWORK\b", tail, flags=re.IGNORECASE)
+        candidates = [x.start() for x in [stop, stop2] if x]
+        end = min(candidates) if candidates else 300
+        block = (rest + "\n" + tail[:end]).strip()
+
+        # keep meaningful lines
+        lines = []
+        for ln in block.splitlines():
+            s = ln.strip()
+            if not s:
+                continue
+            if re.search(r"^(Description|Item Code|Quantity|Unit price|Amount|Dear Sirs)$", s, re.IGNORECASE):
+                continue
+            lines.append(s)
+
+        desc_map[item] = _clean_ws(" ".join(lines)) if lines else item
+
+    # Detail line: "00010 30980279 5 ST 1,378.37 6,891.85"
+    detail_pat = re.compile(
+        r"^\s*(?P<item>\d{5})\s+(?P<code>\d{5,})\s+"
+        r"(?P<qty>\d+(?:[.,]\d+)?)\s+(?P<uom>[A-Z]{1,6})\s+"
+        r"(?P<unit>[\d.,]+)\s+(?P<amt>[\d.,]+)\s*$",
+        re.IGNORECASE | re.MULTILINE,
     )
-    if m:
-        block = m.group(1)
-        flat = " ".join(line.strip() for line in block.splitlines() if line.strip())
-        return flat
 
-    # Fallback
-    return (
-        "SP Distribution PLC, 320 St Vincent Street, Glasgow G2 5AD, Scotland"
-    )
+    for m in detail_pat.finditer(text):
+        item = m.group("item").strip()
+        code = m.group("code").strip()
+        qty = _norm_num(m.group("qty"))
+        uom = m.group("uom").upper().strip()
+        desc = desc_map.get(item, code)
 
-
-def _extract_delivery_date(text: str) -> str:
-    # Delivery date: 05.06.2025
-    m = re.search(r"Delivery date[: ]+(\d{2}\.\d{2}\.\d{4})", text, flags=re.I)
-    return m.group(1) if m else ""
-
-
-# ---------------------------------------------------------------------------
-# LINE EXTRACTION
-# ---------------------------------------------------------------------------
-
-def _extract_lines(text: str, delivery_date: str):
-    """
-    Line structure:
-
-    00010 JT BRANCH...
-    detailed description...
-    00010 30980279 5 ST 1,378.37 6,891.85
-    """
-    lines = []
-
-    # Match the numeric line row
-    row_regex = re.compile(
-        r"(000\d{2})\s+"                # item no
-        r"([0-9]+)\s+"                  # item code
-        r"(\d+)\s+ST\s+"                # quantity
-        r"([\d\.,]+)\s+"                # price
-        r"([\d\.,]+)",                  # amount
-        flags=re.I
-    )
-
-    for m in row_regex.finditer(text):
-        item_no = m.group(1)
-        code = m.group(2)
-        qty = m.group(3)
-        price = m.group(4).replace(",", "")
-        amount = m.group(5).replace(",", "")
-
-        # Extract description = text above numeric row until previous blank line
-        # We'll take 300 chars above this row and clean it.
-        start = max(0, m.start() - 300)
-        block = text[start:m.start()]
-        block = block.strip()
-
-        desc_lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
-        description = " ".join(desc_lines)
-
-        lines.append({
-            "item_no": item_no,
-            "customer_product_no": code,
-            "description": description,
+        rows.append({
+            "item_no": item,
+            "te_part_number": code,
+            "description": desc,
             "quantity": qty,
-            "uom": "ST",
-            "price": price,
-            "line_value": amount,
-            "te_part_number": "",
-            "manufacturer_part_no": "",
-            "delivery_date": delivery_date,
+            "uom": uom,
         })
 
-    return lines
+    if rows:
+        return rows
+
+    # Fallback: try any "Total GBP" doc with one numeric line
+    fb = re.search(r"Total\s+GBP\s+([\d.,]+)", text, flags=re.IGNORECASE)
+    if fb:
+        return [{
+            "item_no": "1",
+            "te_part_number": "Not found",
+            "description": "Not found",
+            "quantity": "1",
+            "uom": "EA",
+        }]
+
+    return [{
+        "item_no": "1",
+        "te_part_number": "Not found",
+        "description": "Not found",
+        "quantity": "1",
+        "uom": "EA",
+    }]
 
 
-# ---------------------------------------------------------------------------
-# MAIN PARSER
-# ---------------------------------------------------------------------------
-
-def parse_sp_power_systems(text: str) -> dict:
-    """
-    Produce v11.3.2-compliant header + lines dict.
-    """
-
-    po_number = _extract_po_number(text)
-    po_date = _extract_po_date(text)
-    buyer = _extract_buyer(text)
-    delivery_address = _extract_delivery_address(text)
-    delivery_date = _extract_delivery_date(text)
-
-    lines = _extract_lines(text, delivery_date)
-
+def parse_sp_power_systems(text: str) -> Dict[str, Any]:
     header = {
-        "po_number": po_number,
-        "po_date": po_date,
-        "customer_name": "SP Power Systems Ltd",
-        "buyer": buyer,
-        "delivery_address": delivery_address,
+        "po_number": "Not found",
+        "po_date": "Not found",
+        "customer_name": "SP Distribution PLC",
+        "buyer": "Not found",
+        "delivery_address": "Not found",
     }
 
-    return {
-        "header": header,
-        "lines": lines,
-    }
+    if not text:
+        return {"header": header, "lines": []}
+
+    header["po_number"] = _nf(_find_first(
+        [r"\bRef\.\s*:\s*(\d+)\b", r"\bCall-off Order\s*Ref\.\s*:\s*(\d+)\b"],
+        text,
+        flags=re.IGNORECASE,
+    ))
+
+    header["po_date"] = _nf(_find_first(
+        [r"\bDate:\s*(\d{2}\.\d{2}\.\d{4})\b"],
+        text,
+        flags=re.IGNORECASE,
+    ))
+
+    buyer = _find_first(
+        [r"\bManager\s*\n\s*([A-Z][A-Z\s'\-]+)\b", r"\bManager\s+([A-Z][A-Z\s'\-]+)\b"],
+        text,
+        flags=re.IGNORECASE,
+    )
+    header["buyer"] = _nf(_clean_ws(buyer) if buyer else None)
+
+    delivery = _find_first(
+        [r"\bSHIP TO LOCATION\s*(.*?)(?:\n\s*Delivery date:|\n\s*Subject|\n\s*Dear\s+Sirs)"],
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    header["delivery_address"] = _nf(_clean_ws(delivery) if delivery else None)
+
+    lines = _parse_lines(text)
+
+    for k in REQUIRED_HEADER_KEYS:
+        header[k] = _nf(header.get(k))
+
+    return {"header": header, "lines": lines}

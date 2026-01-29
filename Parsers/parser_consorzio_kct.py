@@ -1,135 +1,186 @@
 import re
+from typing import Dict, Any, List, Optional
+
 
 # ---------------------------------------------------------------------------
-# DETECTION
+# DETECTION (works for your extracted text)
 # ---------------------------------------------------------------------------
 
 def detect_consorzio_kct(text: str) -> bool:
-    """
-    Detect CONSORZIO KCT purchase orders.
-    """
     if not text:
         return False
+    t = text.upper()
 
-    t = text.lower()
-    triggers = [
-        "consorzio kct",
-        "centergross",
-        "numero documento",
-        "data evasione",
-        "iban: it92f05387",
-    ]
-    return any(trig in t for trig in triggers)
+    # This doc family has a very stable TE ship-to block + Italian "Destinazione: Destinatario:"
+    if ("DESTINAZIONE" in t and "DESTINATARIO" in t
+        and "TE CONNECTIVITY ITALIA" in t
+        and ("COLLEGNO" in t or "CORSO F.LLI CERVI" in t or "CORSO FRATELLI CERVI" in t)
+        and "ORDINE" in t):
+        return True
+
+    return False
 
 
 # ---------------------------------------------------------------------------
-# HEADER EXTRACTION
+# HELPERS
 # ---------------------------------------------------------------------------
 
-def _extract_po_number(text: str) -> str:
-    m = re.search(r"Numero documento\s*([0-9]+)", text, flags=re.I)
-    return m.group(1).strip() if m else ""
+REQUIRED_HEADER_KEYS = ["po_number", "po_date", "customer_name", "buyer", "delivery_address"]
 
+def _nf(v: Optional[str]) -> str:
+    s = (v or "").strip()
+    return s if s else "Not found"
 
-def _extract_po_date(text: str) -> str:
-    m = re.search(r"Data documento\s*([0-9]{2}\/[0-9]{2}\/[0-9]{4})", text)
+def _clean_ws(s: Optional[str]) -> str:
+    return " ".join((s or "").split()).strip()
+
+def _fmt_date(d: str) -> str:
+    # dd/mm/yyyy -> dd.mm.yyyy
+    if not d:
+        return "Not found"
+    d = d.strip()
+    m = re.match(r"^(\d{2})/(\d{2})/(\d{4})$", d)
     if m:
-        d = m.group(1)
-        return d.replace("/", ".")
-    return ""
+        return f"{m.group(1)}.{m.group(2)}.{m.group(3)}"
+    return d
 
-
-def _extract_delivery_address(text: str) -> str:
-    """
-    No delivery address block → use head-office fallback.
-    """
-    return (
-        "Consorzio KCT, Via degli Orefici 169 Blocco 26, 40050 Centergross Funo di Argelato (BO), Italy"
-    )
-
-
-def _extract_buyer(text: str) -> str:
-    # No named buyer in this PO
-    return ""
+def _eu_to_float(s: str) -> float:
+    if s is None:
+        return 0.0
+    x = str(s).strip().replace(" ", "")
+    if not x:
+        return 0.0
+    # If comma exists => EU decimal, remove thousands dots
+    if "," in x:
+        x = x.replace(".", "").replace(",", ".")
+    try:
+        return float(x)
+    except Exception:
+        return 0.0
 
 
 # ---------------------------------------------------------------------------
-# LINE EXTRACTION
+# HEADER
 # ---------------------------------------------------------------------------
 
-def _to_float_eu(val: str) -> float:
-    return float(val.replace(".", "").replace(",", "."))
-
-
-def _extract_lines(text: str):
+def _extract_po_date_and_number(text: str) -> (str, str):
     """
-    Parse rows of format:
-
-    2116774001 GPO-135-3,2/1,6-0-SP ... MT 300,000 0,23069 69,21 27/08/2025
+    In your extracted text we see:
+      "Rif. n. fornitore Data documento Numero documento"
+      "Del: / / 05/08/2025 2500507"
     """
+    m = re.search(
+        r"DATA\s+DOCUMENTO\s+NUMERO\s+DOCUMENTO\s+DEL:\s*/\s*/\s*(\d{2}/\d{2}/\d{4})\s+(\d{5,})",
+        text,
+        flags=re.IGNORECASE
+    )
+    if m:
+        return _fmt_date(m.group(1)), m.group(2)
 
-    pattern = re.compile(
-        r"([0-9]{6,})\s+"                  # Product code
-        r"([A-Za-z0-9\-/., ]+?)\s+"        # Description
-        r"(MT|NR)\s+"                      # UoM
-        r"([\d\.,]+)\s+"                   # Quantity
-        r"([\d\.,]+)\s+"                   # Price
-        r"([\d\.,]+)\s+"                   # Line total
-        r"(\d{2}\/\d{2}\/\d{4})",          # Delivery date
-        flags=re.I
+    # fallback (more tolerant)
+    m = re.search(r"\bDEL:\s*/\s*/\s*(\d{2}/\d{2}/\d{4})\s+(\d{5,})\b", text, flags=re.IGNORECASE)
+    if m:
+        return _fmt_date(m.group(1)), m.group(2)
+
+    return "Not found", "Not found"
+
+
+# ---------------------------------------------------------------------------
+# LINES
+# ---------------------------------------------------------------------------
+
+def _parse_lines(text: str) -> List[Dict[str, Any]]:
+    if not text:
+        return []
+
+    # Keep line breaks (this PDF extracts cleanly with \n)
+    lines = (text or "").splitlines()
+
+    # Find the header line containing "Codice" / "Descrizione" then parse from there
+    start_idx = 0
+    for i, ln in enumerate(lines):
+        if "Codice" in ln and "Descr" in ln and "Data evasione" in ln:
+            start_idx = i + 1
+            break
+
+    tail = "\n".join(lines[start_idx:]).strip()
+    if not tail:
+        return []
+
+    # Flatten each physical line separately; this PDF is mostly one-row-per-line
+    out: List[Dict[str, Any]] = []
+    row_re = re.compile(
+        # CODE
+        r"^(?P<code>[A-Z0-9\-]{5,})\s+"
+        # DESC (lazy)
+        r"(?P<desc>.+?)\s+"
+        # UOM
+        r"(?P<uom>MT|NR|PC|PZ|ST)\s+"
+        # QTY
+        r"(?P<qty>\d[\d\.,]*)\s+"
+        # PRICE
+        r"(?P<price>\d[\d\.,]*)\s+"
+        # AMOUNT
+        r"(?P<amount>\d[\d\.,]*)\s+"
+        # DELIVERY DATE
+        r"(?P<date>\d{2}/\d{2}/\d{4})\s+"
+        # VAT/C.I. code (e.g., 22)
+        r"(?P<vat>\d{1,2})\s*$",
+        flags=re.IGNORECASE
     )
 
-    lines = []
+    for ln in tail.splitlines():
+        ln = _clean_ws(ln)
+        if not ln:
+            continue
 
-    for m in pattern.finditer(text):
-        code = m.group(1)
-        desc = m.group(2).strip()
-        uom = m.group(3)
-        qty = m.group(4)
-        price_raw = m.group(5)
-        total_raw = m.group(6)
-        date_raw = m.group(7)
+        m = row_re.match(ln)
+        if not m:
+            continue
 
-        qty_norm = qty.replace(".", "").replace(",", ".")
-        price = _to_float_eu(price_raw)
-        total = _to_float_eu(total_raw)
-        delivery_date = date_raw.replace("/", ".")
+        code = m.group("code").strip()
+        desc = _clean_ws(m.group("desc"))
+        uom = m.group("uom").upper().strip()
 
-        # TE PN for Consorzio = first code column
-        te_part = code
+        qty_raw = m.group("qty")
+        price_raw = m.group("price")
+        amount_raw = m.group("amount")
+        date_raw = m.group("date")
 
-        lines.append({
-            "item_no": "",                     # They do not provide line numbers → leave blank
+        out.append({
+            "item_no": str(len(out) + 1),
             "customer_product_no": code,
+            "manufacturer_part_no": code,
+            "te_part_number": code,   # enrichment mapping will resolve where needed
             "description": desc,
-            "quantity": qty_norm,
+            "quantity": qty_raw.replace(" ", ""),
             "uom": uom,
-            "price": price,
-            "line_value": total,
-            "te_part_number": te_part,
-            "manufacturer_part_no": te_part,
-            "delivery_date": delivery_date,
+            "price": _eu_to_float(price_raw),
+            "line_value": _eu_to_float(amount_raw),
+            "delivery_date": _fmt_date(date_raw),
         })
 
-    return lines
+    return out
 
 
 # ---------------------------------------------------------------------------
 # MAIN PARSER
 # ---------------------------------------------------------------------------
 
-def parse_consorzio_kct(text: str) -> dict:
+def parse_consorzio_kct(text: str) -> Dict[str, Any]:
+    po_date, po_number = _extract_po_date_and_number(text)
+
     header = {
-        "po_number": _extract_po_number(text),
-        "po_date": _extract_po_date(text),
+        "po_number": _nf(po_number),
+        "po_date": _nf(po_date),
         "customer_name": "Consorzio KCT",
-        "buyer": _extract_buyer(text),
-        "delivery_address": _extract_delivery_address(text),
+        "buyer": "Consorzio KCT",  # doc doesn't reliably contain a person name
+        "delivery_address": "Consorzio KCT, Via degli Orefici 169 Blocco 26, 40050 Centergross Funo di Argelato (BO), Italy",
     }
 
-    lines = _extract_lines(text)
+    lines = _parse_lines(text)
 
-    return {
-        "header": header,
-        "lines": lines,
-    }
+    for k in REQUIRED_HEADER_KEYS:
+        header[k] = _nf(header.get(k))
+
+    return {"header": header, "lines": lines}

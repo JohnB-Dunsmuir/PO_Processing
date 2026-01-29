@@ -1,161 +1,162 @@
+# Parsers/parser_sse_stock.py
 import re
-
-# ---------------------------------------------------------------------------
-# DETECTION
-# ---------------------------------------------------------------------------
+from typing import Dict, List, Any, Optional
 
 def detect_sse_stock(text: str) -> bool:
-    """
-    Detect SSE Stock Ltd purchase orders.
-    """
     if not text:
         return False
+    t = text.upper()
+    # Strong SSE signals: SSE STOCK / SSE LOGISTICS / "Standard Purchase Order" + SSE
+    return ("SSE STOCK" in t or "SSE LOGISTICS" in t or "SSE STOCK LTD" in t or "STANDARD PURCHASE ORDER" in t) and ("SSE" in t or "THATCHAM" in t or "THATCHAM" in t.upper())
 
-    t = text.lower()
-    triggers = [
-        "sse stock ltd",
-        "standard purchase order",
-        "inveralmond house",
-        "dunn,mr ryan",
-        "supplier item",
-    ]
-    return any(trig in t for trig in triggers)
+REQUIRED_HEADER_KEYS = ["po_number", "po_date", "customer_name", "buyer", "delivery_address"]
 
+def _nf(v: Optional[str]) -> str:
+    if v is None:
+        return "Not found"
+    s = str(v).strip()
+    return s if s else "Not found"
 
-# ---------------------------------------------------------------------------
-# HEADER EXTRACTION
-# ---------------------------------------------------------------------------
+def _clean_ws(s: Optional[str]) -> str:
+    if not s:
+        return "Not found"
+    return " ".join(s.split()).strip()
 
-def _extract_po_number(text: str) -> str:
-    m = re.search(r"Order\s+(\d+)", text, flags=re.I)
-    return m.group(1).strip() if m else ""
+def _find_first(patterns, text: str, flags=0) -> Optional[str]:
+    for pat in patterns:
+        m = re.search(pat, text, flags)
+        if m:
+            if m.lastindex:
+                return m.group(m.lastindex).strip()
+            return m.group(0).strip()
+    return None
 
+def _norm_qty(q: str) -> str:
+    if not q:
+        return "Not found"
+    return q.strip().replace(",", ".")
 
-def _extract_po_date(text: str) -> str:
-    m = re.search(r"Order Date\s+([0-9]{2}-[A-Za-z]{3}-[0-9]{4})", text, flags=re.I)
-    return m.group(1).strip() if m else ""
-
-
-def _extract_buyer(text: str) -> str:
-    # Buyer Dunn,Mr Ryan
-    m = re.search(r"Buyer\s+([A-Za-z ,\.]+)", text, flags=re.I)
-    return m.group(1).strip() if m else ""
-
-
-def _extract_delivery_address(text: str) -> str:
+def _parse_lines(text: str) -> List[Dict[str, Any]]:
     """
-    'Ship To:' block on page 1.
-    If missing, use head-office fallback.
+    SSE pinned rule:
+      - "Supplier Item" is TE part number (wins if present)
+      - Stock Number remains customer_product_no
+    We parse line blocks and extract Supplier Item within each block.
     """
-    m = re.search(
-        r"Ship To:\s*([\s\S]*?)Bill To:",
-        text,
-        flags=re.I
-    )
+    lines: List[Dict[str, Any]] = []
+    sane_uom = {"EA","EACH","PCS","PC","SET","M","ST","STK","KIT"}
+
+    # Work in the order lines region if possible
+    start = 0
+    m = re.search(r"\b(Order\s+Lines|Line\s+Items)\b", text, flags=re.IGNORECASE)
     if m:
-        block = m.group(1)
-        flat = " ".join(line.strip() for line in block.splitlines() if line.strip())
-        return flat
+        start = m.start()
+    region = text[start:]
 
-    # Fallback to head office
-    return (
-        "SSE Stock Ltd, Inveralmond House, 200 Dunkeld Road, Perth PH1 3AQ, Scotland"
-    )
+    # Identify each line item by "Line <n>" or a leading item number + stock number.
+    # We create blocks from each detected start to the next.
+    starts = []
+    for mm in re.finditer(r"^\s*(?P<item>\d{1,4})\s+(?P<stock>\d{5,})\b", region, flags=re.MULTILINE):
+        starts.append((mm.start(), mm.group("item"), mm.group("stock")))
 
-
-# ---------------------------------------------------------------------------
-# LINE EXTRACTION
-# ---------------------------------------------------------------------------
-
-def _extract_lines(text: str):
-    """
-    SSE lines structure:
-
-    Line  StockNo  RequiredBy  Qty  UoM  UnitPrice  Amount
-    Supplier Item: XXXX
-    Description...
-    """
-
-    # Match the line header
-    line_header = re.compile(
-        r"(\d+)\s+"                # item number
-        r"([A-Za-z0-9]+)\s+"       # stock number
-        r"Required By:\s*([0-9\-A-Za-z: ]+)\s+"
-        r"(\d+)\s+"                # quantity
-        r"([A-Za-z]+)\s+"          # UOM
-        r"([\d\.]+)\s+"            # unit price
-        r"([\d\.,]+)",             # amount
-        flags=re.I
-    )
-
-    lines = []
-
-    for m in line_header.finditer(text):
-        item_no = m.group(1)
-        stock_no = m.group(2)
-        req_by = m.group(3).strip()
-        qty = m.group(4)
-        uom = m.group(5)
-        price = m.group(6)
-        amount = m.group(7).replace(",", "")
-
-        # Extract TE PN if "Supplier Item:" occurs near this line
-        # Search up to 200 chars after match
-        slice_start = m.end()
-        slice_end = slice_start + 300
-        segment = text[slice_start:slice_end]
-
-        te_m = re.search(r"Supplier Item:\s*([A-Za-z0-9\-\_]+)", segment, flags=re.I)
-        te_part = te_m.group(1) if te_m else ""
-
-        # Extract description: text until next line header or end of segment
-        desc_m = re.search(
-            r"Supplier Item:.*?\n([\s\S]*?)(?=\n\d+\s+[A-Za-z0-9]+|$)",
-            segment,
-            flags=re.I
-        )
-        if desc_m:
-            desc_block = " ".join(line.strip() for line in desc_m.group(1).splitlines() if line.strip())
-        else:
-            # fallback: take one or two lines of text
-            desc_block = ""
-
-        lines.append({
-            "item_no": item_no,
-            "customer_product_no": stock_no,
-            "description": desc_block,
+    # If we can't find starts, keep previous behavior but try to at least attach Supplier Item if present.
+    if not starts:
+        sup = _find_first([r"\bSupplier\s+Item\s*[:\-]?\s*([A-Z0-9\-_/\.]+)\b"], region, flags=re.IGNORECASE)
+        mqty = re.search(r"\b(\d{1,4}(?:[.,]\d+)?)\s+(EA|EACH|PCS|PC|STK|ST|KIT)\b", region, flags=re.IGNORECASE)
+        qty = _norm_qty(mqty.group(1)) if mqty else "1"
+        uom = (mqty.group(2).upper() if mqty else "EA")
+        return [{
+            "item_no": "1",
+            "customer_product_no": "Not found",
+            "te_part_number": sup if sup else "Not found",
+            "manufacturer_part_no": "Not found",
+            "description": "Not found",
             "quantity": qty,
             "uom": uom,
-            "price": price,
-            "line_value": amount,
-            "te_part_number": te_part,
-            "manufacturer_part_no": te_part,
-            "delivery_date": req_by,
+        }]
+
+    # Build blocks
+    for idx, (pos, item, stock) in enumerate(starts):
+        end = starts[idx + 1][0] if idx + 1 < len(starts) else len(region)
+        block = region[pos:end]
+
+        te_pn = _find_first([r"\bSupplier\s+Item\s*[:\-]?\s*([A-Z0-9\-_/\.]+)\b"], block, flags=re.IGNORECASE)
+        # Sometimes Supplier Item appears without colon
+        if not te_pn:
+            te_pn = _find_first([r"\bSupplier\s+Item\b\s+([A-Z0-9\-_/\.]+)\b"], block, flags=re.IGNORECASE)
+
+        # Qty/UOM: take the first reasonable qty+uom after the stock number line
+        mqty = re.search(r"\b(\d{1,4}(?:[.,]\d+)?)\s+(EA|EACH|PCS|PC|STK|ST|KIT)\b", block, flags=re.IGNORECASE)
+        qty = _norm_qty(mqty.group(1)) if mqty else "Not found"
+        uom = (mqty.group(2).upper() if mqty else "Not found")
+
+        # Description: take a short line after stock number if available
+        desc = "Not found"
+        # remove first line tokens
+        bl_lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
+        if bl_lines:
+            # pick the first line that is not just the header line and not "Required By:"
+            for ln in bl_lines[1:6]:
+                if re.search(r"^Required\s+By\s*:", ln, re.IGNORECASE):
+                    continue
+                if re.search(r"^Supplier\s+Item", ln, re.IGNORECASE):
+                    continue
+                if len(ln) > 3:
+                    desc = _clean_ws(ln)
+                    break
+
+        lines.append({
+            "item_no": item.strip(),
+            "customer_product_no": stock.strip(),
+            "te_part_number": te_pn.strip() if te_pn else "Not found",
+            "manufacturer_part_no": "Not found",
+            "description": desc,
+            "quantity": qty,
+            "uom": uom,
         })
 
     return lines
 
-
-# ---------------------------------------------------------------------------
-# MAIN PARSER
-# ---------------------------------------------------------------------------
-
-def parse_sse_stock(text: str) -> dict:
-    """
-    Return header + lines dict for unified engine v11.3.2.
-    """
-
+def parse_sse_stock(text: str) -> Dict[str, Any]:
     header = {
-        "po_number": _extract_po_number(text),
-        "po_date": _extract_po_date(text),
+        "po_number": "Not found",
+        "po_date": "Not found",
         "customer_name": "SSE Stock Ltd",
-        "buyer": _extract_buyer(text),
-        "delivery_address": _extract_delivery_address(text),
+        "buyer": "Not found",
+        "delivery_address": "Not found",
     }
 
-    lines = _extract_lines(text)
+    if not text:
+        return {"header": header, "lines": []}
 
-    return {
-        "header": header,
-        "lines": lines,
-    }
+    header["po_number"] = _nf(_find_first([
+        r"\bOrder\s*(?:Number|No\.?)\s*[:\-]?\s*([A-Z0-9\-\_]{4,})\b",
+        r"\bOrder\s*(\d{6,})\b",
+        r"\b(\d{7,})\b"
+    ], text, flags=re.IGNORECASE))
+
+    header["po_date"] = _nf(_find_first([
+        r"\bOrder\s+Date\s*[:\-]?\s*(\d{2}[./-]\d{2}[./-]\d{4})\b",
+        r"\bOrder\s+Date\s*[:\-]?\s*(\d{2}-[A-Z]{3}-\d{4})\b",
+        r"\b(\d{2}[./-]\d{2}[./-]\d{4})\b",
+        r"\b(\d{2}-[A-Z]{3}-\d{4})\b"
+    ], text, flags=re.IGNORECASE))
+
+    header["buyer"] = _nf(_find_first([
+        r"\bBuyer\s*[:\-]?\s*([^\n\r]+)",
+        r"\bBuyer\s*([^\n\r]+)",
+        r"\bFAO\s*[:\-]?\s*([^\n\r]+)"
+    ], text, flags=re.IGNORECASE))
+
+    header["delivery_address"] = _nf(_find_first([
+        r"\bDeliver(?:y|ies)?\s+To\s*[:\-]?\s*(.*?)(?:\n\s*\n|Order\b|Invoice\b|Buyer\b)",
+        r"(SSE\s+LOGISTICS\s+CENTRE.*?THATCHAM.*?RG[0-9]{2})",
+        r"(SSE\s+LOGISTICS.*?THATCHAM.*?UNITED KINGDOM)"
+    ], text, flags=re.IGNORECASE | re.DOTALL))
+
+    lines = _parse_lines(text)
+
+    for k in REQUIRED_HEADER_KEYS:
+        header[k] = _nf(header.get(k))
+
+    return {"header": header, "lines": lines}

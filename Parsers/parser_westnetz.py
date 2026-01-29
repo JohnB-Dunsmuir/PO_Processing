@@ -1,143 +1,168 @@
-import re
+# Parsers/parser_westnetz.py
 
-# ---------------------------------------------------------------------------
-# DETECTION
-# ---------------------------------------------------------------------------
+import re
+from typing import Dict, List, Any, Optional
+
 
 def detect_westnetz(text: str) -> bool:
-    """
-    Detect Westnetz GmbH purchase orders.
-    """
     if not text:
         return False
-
-    t = text.lower()
-    triggers = [
-        "westnetz gmbh",
-        "bestellnummer",
-        "lieferdatum",
-        "einkaufssachbearbeiter",
-        "wir sind das netz der",
-    ]
-    return any(trig in t for trig in triggers)
+    t = text.upper()
+    return "WESTNETZ" in t and ("FLORIANSTRASSE" in t or "DORTMUND" in t)
 
 
-# ---------------------------------------------------------------------------
-# HEADER EXTRACTION
-# ---------------------------------------------------------------------------
-
-def _extract_po_number(text: str) -> str:
-    m = re.search(r"Bestellnummer\s+([A-Za-z0-9\/\-]+)", text, flags=re.I)
-    return m.group(1).strip() if m else ""
+REQUIRED_HEADER_KEYS = ["po_number", "po_date", "customer_name", "buyer", "delivery_address"]
 
 
-def _extract_po_date(text: str) -> str:
-    # Example: "29. August 2025"
-    m = re.search(r"(\d{1,2}\.\s*[A-Za-z]+\s*\d{4})", text)
-    return m.group(1).strip() if m else ""
+def _nf(v: Optional[str]) -> str:
+    if v is None:
+        return "Not found"
+    s = str(v).strip()
+    return s if s else "Not found"
 
 
-def _extract_buyer(text: str) -> str:
-    # Einkaufssachbearbeiter/in: Louis Postus
-    m = re.search(r"Einkaufssachbearbeiter.*?:\s*([A-Za-z ]+)", text, flags=re.I)
-    return m.group(1).strip() if m else ""
+def _clean_ws(s: str) -> str:
+    return " ".join((s or "").split()).strip()
+
+
+def _find_first(patterns, text, flags=0) -> Optional[str]:
+    for pat in patterns:
+        m = re.search(pat, text, flags)
+        if m:
+            return m.group(1).strip()
+    return None
+
+
+def _norm_qty(q: str) -> str:
+    q = (q or "").strip()
+    if re.match(r"^\d{1,3}(\.\d{3})+$", q):
+        return q.replace(".", "")
+    return q.replace(",", ".")
 
 
 def _extract_delivery_address(text: str) -> str:
-    """
-    Delivery block appears under 'Lieferadresse' until next blank line or footer.
-    """
-    m = re.search(r"Lieferadresse\s*([\s\S]*?)(?:\n\s*\n|$)", text, flags=re.I)
-    if not m:
-        return ""
+    blk = _find_first(
+        [
+            r"\bLiefer(?:adresse|anschrift)\b\s*[:\-]?\s*(.*?)(?:\n\s*\n|Rechnungsadresse|Bestellnummer|Bestellung|Seite\s+\d)",
+        ],
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if blk:
+        return _clean_ws(blk)
 
-    block = m.group(1)
-    flat = " ".join(line.strip() for line in block.splitlines() if line.strip())
-    return flat
-
-
-# ---------------------------------------------------------------------------
-# LINE EXTRACTION
-# ---------------------------------------------------------------------------
-
-def _to_float_de(number: str) -> float:
-    """
-    Converts German number format (1.530,30) → 1530.30
-    """
-    if not number:
-        return 0.0
-    cleaned = number.replace(".", "").replace(",", ".")
-    try:
-        return float(cleaned)
-    except:
-        return 0.0
+    blk2 = _find_first(
+        [
+            r"(Westnetz\s+GmbH.*?Florianstraße\s+15-21.*?44139\s+Dortmund)",
+        ],
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    return _clean_ws(blk2) if blk2 else "Not found"
 
 
-def _extract_lines(text: str):
-    """
-    Westnetz lines follow this pattern:
+def _parse_lines(text: str) -> List[Dict[str, Any]]:
+    lines: List[Dict[str, Any]] = []
 
-    00010   30kV_Endmuffe      3 ST    192,49/ 1 ST    577,47
-    00020   30kV_Verbindungsmuffe 3 ST 510,10/ 1 ST  1.530,30
-    """
+    sane_uom = {"ST", "STK", "EA", "EACH", "PCS", "PC", "M"}
 
-    line_regex = re.compile(
-        r"(000\d{2})\s+"                  # item number, e.g. 00010
-        r"([A-Za-z0-9_]+)\s+"             # material/leistung (customer product number)
-        r"(\d+)\s+ST\s+"                  # quantity + ST
-        r"([\d\.,]+)\s*/\s*1\s*ST\s+"     # price per unit
-        r"([\d\.,]+)",                    # line total
-        flags=re.I
+    region = text
+    mstart = re.search(r"\b(Pos\.?|Position)\b|\bMenge\b|\bMaterial\b", text, flags=re.IGNORECASE)
+    if mstart:
+        region = text[mstart.start():]
+
+    row = re.compile(
+        r"^\s*(?P<item>\d{1,5})\s+"
+        r"(?P<code>\d{6,}|\d{1,2}-\d{4,8}-\d{1,3}|[A-Z0-9][A-Z0-9\-/\.]{4,})\s+"
+        r"(?P<desc>.+?)\s+"
+        r"(?P<qty>\d+(?:[.,]\d+)?|\d{1,3}(?:\.\d{3})+)\s+"
+        r"(?P<uom>[A-Za-z]{1,6})\b.*$",
+        re.IGNORECASE | re.MULTILINE,
     )
 
-    lines = []
+    for m in row.finditer(region):
+        uom = (m.group("uom") or "").upper().strip().rstrip(".")
+        if uom not in sane_uom:
+            continue
 
-    for m in line_regex.finditer(text):
-        item_no = m.group(1)
-        customer_product = m.group(2)
-        qty = m.group(3)
-        price_raw = m.group(4)
-        total_raw = m.group(5)
+        lines.append(
+            {
+                "item_no": m.group("item").strip(),
+                "customer_product_no": m.group("code").strip(),
+                "te_part_number": "Not found",
+                "manufacturer_part_no": "Not found",
+                "description": _clean_ws(m.group("desc")) or "Not found",
+                "quantity": _norm_qty(m.group("qty")),
+                "uom": uom,
+            }
+        )
 
-        price = _to_float_de(price_raw)
-        line_value = _to_float_de(total_raw)
-
-        lines.append({
-            "item_no": item_no,
-            "customer_product_no": customer_product,
-            "description": customer_product,       # Same as material text
-            "quantity": qty,
-            "uom": "ST",
-            "price": price,
-            "line_value": line_value,
-            "te_part_number": "",
-            "manufacturer_part_no": "",
-            "delivery_date": "",                  # No delivery date present
-        })
+    if not lines:
+        m2 = re.search(r"\b(\d+(?:[.,]\d+)?)\s+(STK|ST|EA|EACH|PCS|PC|M)\b", text, flags=re.IGNORECASE)
+        if m2:
+            lines.append(
+                {
+                    "item_no": "1",
+                    "customer_product_no": "Not found",
+                    "te_part_number": "Not found",
+                    "manufacturer_part_no": "Not found",
+                    "description": "Not found",
+                    "quantity": _norm_qty(m2.group(1)),
+                    "uom": m2.group(2).upper(),
+                }
+            )
 
     return lines
 
 
-# ---------------------------------------------------------------------------
-# MAIN PARSER ENTRYPOINT
-# ---------------------------------------------------------------------------
-
-def parse_westnetz(text: str) -> dict:
-    """
-    Return dict with "header" and "lines" for the unified engine v11.3.2.
-    """
-
+def parse_westnetz(text: str) -> Dict[str, Any]:
     header = {
-        "po_number": _extract_po_number(text),
-        "po_date": _extract_po_date(text),
+        "po_number": "Not found",
+        "po_date": "Not found",
         "customer_name": "Westnetz GmbH",
-        "buyer": _extract_buyer(text),
-        "delivery_address": _extract_delivery_address(text),
+        "buyer": "Not found",
+        "delivery_address": "Not found",
     }
 
-    lines = _extract_lines(text)
+    if not text:
+        return {"header": header, "lines": []}
 
-    return {
-        "header": header,
-        "lines": lines,
-    }
+    header["po_number"] = _nf(_find_first(
+        [
+            r"\bBestell(?:nummer|nr\.)\b\s*[:\-]?\s*(\d{8,12})\b",
+            r"\bBestellung\s+Nr\.\s*(\d{8,12})\b",
+            r"\bPO\s*(?:No\.?|Number)\s*[:\-]?\s*(\d{8,12})\b",
+        ],
+        text,
+        flags=re.IGNORECASE,
+    ))
+
+    header["po_date"] = _nf(_find_first(
+        [
+            r"\bDatum\b\s*[:\-]?\s*(\d{2}\.\d{2}\.\d{4})\b",
+            r"\bBestelldatum\b\s*[:\-]?\s*(\d{2}\.\d{2}\.\d{4})\b",
+            r"\b(\d{2}\.\d{2}\.\d{4})\b",
+        ],
+        text,
+        flags=re.IGNORECASE,
+    ))
+
+    buyer = _find_first(
+        [
+            r"\bEinkaufssachbearbeiter/in\s*:\s*([^\n\r]+)",
+            r"\bSachbearbeiter/in\s*:\s*([^\n\r]+)",
+            r"\bAnsprechpartner\s*:\s*([^\n\r]+)",
+        ],
+        text,
+        flags=re.IGNORECASE,
+    )
+    header["buyer"] = _nf(_clean_ws(buyer) if buyer else None)
+
+    header["delivery_address"] = _nf(_extract_delivery_address(text))
+
+    lines = _parse_lines(text)
+
+    for k in REQUIRED_HEADER_KEYS:
+        header[k] = _nf(header.get(k))
+
+    return {"header": header, "lines": lines}

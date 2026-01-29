@@ -10,7 +10,7 @@ Restored working contract:
   - dict
   - {"header":..., "lines":[...]}  (header stamped onto each line)
 - NO forced dict/list migration outside this engine.
-- Address matching optional and embedded (currently OFF by default).
+- Address matching optional and embedded.
 
 ADDED (2026-01-06):
 - Confidence scoring written into Parsed_PO_Lines.xlsx:
@@ -18,6 +18,11 @@ ADDED (2026-01-06):
     - confidence_level (HIGH/MEDIUM/LOW)
     - confidence_missing (missing key fields)
   Weights sum to 100 (true max = 100).
+
+UPDATED (drop-in fix):
+- Master address indexing is tolerant of the real master schema
+  (delivery_address, address_key, Delivery Address Key, address_canonical, etc.)
+- Address matching columns are applied to EVERY output row at end of process_all_pdfs().
 """
 
 from __future__ import annotations
@@ -99,7 +104,7 @@ def _normalize_parsed_to_df(parsed: Any) -> pd.DataFrame:
 
 
 # ----------------------------
-# Address matching (optional, embedded)
+# Address matching (standing/master link) — embedded
 # ----------------------------
 
 def _sanitize_address(addr: Any) -> str:
@@ -114,20 +119,58 @@ def _sanitize_address(addr: Any) -> str:
 
 def _prepare_master_address_index(df_master: pd.DataFrame) -> pd.DataFrame:
     """
-    Master expectations (case-insensitive):
-      - Address (required)
-      - Site (optional)
-    If missing, returns empty -> matching becomes no-op.
+    Build a small index from the master table with:
+      - __addr_raw__ (chosen address string)
+      - __addr_san__ (sanitized for matching)
+      - __site__     (site / ship-to key if present)
+
+    Tolerant to different master schemas:
+      address, delivery_address, address_key, Delivery Address Key, address_canonical, etc.
+
+    If no usable address-like column is found, returns empty -> matching becomes no-op.
     """
     if df_master is None or df_master.empty:
         return pd.DataFrame()
 
     cols = {str(c).strip().lower(): c for c in df_master.columns}
-    if "address" not in cols:
+
+    # Candidate columns for address value (priority order)
+    addr_candidates = [
+        "address",
+        "delivery_address",
+        "delivery address",
+        "address_canonical",
+        "address canonical",
+        "delivery address key",
+        "delivery_address_key",
+        "address_key",
+    ]
+
+    address_col = None
+    for a in addr_candidates:
+        if a in cols:
+            address_col = cols[a]
+            break
+
+    if address_col is None:
         return pd.DataFrame()
 
-    address_col = cols["address"]
-    site_col = cols.get("site")
+    # Candidate columns for site/key mapping back (priority order)
+    site_candidates = [
+        "delivery address key",
+        "delivery_address_key",
+        "address_key",
+        "site",
+        "site_id",
+        "shipto",
+        "ship_to",
+    ]
+
+    site_col = None
+    for s in site_candidates:
+        if s in cols:
+            site_col = cols[s]
+            break
 
     m = df_master.copy()
     m["__addr_raw__"] = m[address_col].fillna("").astype(str)
@@ -140,7 +183,7 @@ def _prepare_master_address_index(df_master: pd.DataFrame) -> pd.DataFrame:
 
 def add_address_matching_columns(df: pd.DataFrame, df_master: pd.DataFrame, log) -> pd.DataFrame:
     """
-    Adds, if a ship-to column exists:
+    Adds, if a ship-to/delivery column exists:
       - ship_to_address_raw
       - ship_to_address_sanitized
       - ship_to_address_matched
@@ -177,6 +220,7 @@ def add_address_matching_columns(df: pd.DataFrame, df_master: pd.DataFrame, log)
     if ship_col is None:
         return df
 
+    # Build lookup maps
     raw_map = dict(zip(master_idx["__addr_raw__"], master_idx["__site__"]))
     san_map = dict(zip(master_idx["__addr_san__"], master_idx["__site__"]))
 
@@ -202,15 +246,17 @@ def add_address_matching_columns(df: pd.DataFrame, df_master: pd.DataFrame, log)
     out.loc[~raw_hit & san_hit, "ship_to_match_method"] = "sanitized"
     out.loc[~raw_hit & san_hit, "ship_to_address_matched"] = True
 
-    log.info(
-        "Address match stats: %s",
-        {
-            "total_rows": int(len(out)),
-            "matched_raw": int(raw_hit.sum()),
-            "matched_sanitized": int((~raw_hit & san_hit).sum()),
-            "unmatched": int((~raw_hit & ~san_hit).sum()),
-        },
-    )
+    if log is not None:
+        log.info(
+            "Address match stats: %s",
+            {
+                "total_rows": int(len(out)),
+                "matched_raw": int(raw_hit.sum()),
+                "matched_sanitized": int((~raw_hit & san_hit).sum()),
+                "unmatched": int((~raw_hit & ~san_hit).sum()),
+            },
+        )
+
     return out
 
 
@@ -250,6 +296,7 @@ def _is_positive_number(x: Any) -> bool:
         s = str(x).strip()
         if s == "" or s.lower() == "nan":
             return False
+
         # tolerate comma decimals/thousands - Excel/locales
         s = s.replace(" ", "")
         # If it has both comma and dot, assume comma is thousands (1,586.25)
@@ -330,12 +377,14 @@ def add_confidence_columns(df: pd.DataFrame) -> pd.DataFrame:
 def process_single_pdf(pdf_path: str, parsers: List[V12ParserModule], df_master: pd.DataFrame, log) -> pd.DataFrame:
     text = extract_text_from_pdf(pdf_path)
     if not text.strip():
-        log.warning("No text extracted from %s", os.path.basename(pdf_path))
+        if log is not None:
+            log.warning("No text extracted from %s", os.path.basename(pdf_path))
         return pd.DataFrame()
 
     sel = select_parser(text, parsers)
     if sel is None:
-        log.warning("NO PARSER FOUND for %s", os.path.basename(pdf_path))
+        if log is not None:
+            log.warning("NO PARSER FOUND for %s", os.path.basename(pdf_path))
         return pd.DataFrame()
 
     parser_name, parser_obj = sel
@@ -343,7 +392,8 @@ def process_single_pdf(pdf_path: str, parsers: List[V12ParserModule], df_master:
     try:
         parsed = parser_obj.parse(text)
     except Exception as e:
-        log.error("Parse failed for %s using %s: %s", os.path.basename(pdf_path), parser_name, e)
+        if log is not None:
+            log.error("Parse failed for %s using %s: %s", os.path.basename(pdf_path), parser_name, e)
         return pd.DataFrame()
 
     df = _normalize_parsed_to_df(parsed)
@@ -355,16 +405,13 @@ def process_single_pdf(pdf_path: str, parsers: List[V12ParserModule], df_master:
     if "ParserUsed" not in df.columns:
         df["ParserUsed"] = parser_name
 
-    # OPTIONAL: enable if/when you want address match columns
-    # df = add_address_matching_columns(df, df_master, log)
-
     return df
 
 
 def process_all_pdfs(log=None) -> None:
     """
-    This is the function you asked for.
-    It lives in: engine/V12_parser_engine.py
+    Deterministic entry point used by V12_main.py.
+    Loads master data, parses all PDFs in ./01_PDFs, writes Parsed_PO_Lines.xlsx.
     """
     if log is None:
         import logging
@@ -372,11 +419,9 @@ def process_all_pdfs(log=None) -> None:
         log = logging.getLogger("V12")
 
     base_dir = Path(__file__).resolve().parent.parent
-
-    # IMPORTANT: your real folder name
     input_dir = base_dir / "01_PDFs"
 
-    # keep master optional
+    # Master file (expected name). You already copied your clean file to this name.
     master_path = base_dir / "03_Master_Data" / "Master Data.xlsx"
 
     parsers = load_parsers(log)
@@ -423,8 +468,15 @@ def process_all_pdfs(log=None) -> None:
 
     out = pd.concat(frames, ignore_index=True)
 
-    # Add confidence columns (engine-only)
+    # Confidence columns
     out = add_confidence_columns(out)
+
+    # Standing/master match columns ON EVERY OUTPUT ROW
+    if not df_master.empty:
+        try:
+            out = add_address_matching_columns(out, df_master, log)
+        except Exception as e:
+            log.warning("Master enrichment failed: %s", e)
 
     out_path = base_dir / "Parsed_PO_Lines.xlsx"
     out.to_excel(out_path, index=False)

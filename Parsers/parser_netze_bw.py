@@ -101,6 +101,14 @@ def _extract_lines(text: str):
         m3 = re.search(r"Liefertermin\s*(\d{2}\.\d{2}\.\d{4})", tail)
         delivery = m3.group(1) if m3 else ""
 
+        # TE Part Number on Netze BW is labelled "Ihre Materialnummer" (may be in the line block)
+        m_te = re.search(r"\bIhre\s+Materialnummer\b\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-/\.]{2,})", tail, flags=re.IGNORECASE)
+        te_pn = m_te.group(1).strip() if m_te else ""
+
+        # Manufacturer part number (if present) is often labelled "Hersteller"
+        m_mfr = re.search(r"\bHersteller\b\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-/\.]{2,})", tail, flags=re.IGNORECASE)
+        mfr_pn = m_mfr.group(1).strip() if m_mfr else ""
+
         lines.append({
             "item_no": str(int(pos)),   # keep SAP numbering (00001 etc.)
             "customer_product_no": mat,
@@ -109,8 +117,8 @@ def _extract_lines(text: str):
             "uom": "ST",
             "price": price,
             "line_value": total,
-            "te_part_number": "",
-            "manufacturer_part_no": "",
+            "te_part_number": te_pn,
+            "manufacturer_part_no": mfr_pn,
             "delivery_date": delivery,
         })
 

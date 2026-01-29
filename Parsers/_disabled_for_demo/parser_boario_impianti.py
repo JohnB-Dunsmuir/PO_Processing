@@ -1,17 +1,35 @@
 import re
-# Boario Impianti S.r.l. parser
+
+# Boario Impianti S.r.l. parser (STRICT detection to avoid collisions)
 
 def detect_boario_impianti(text: str) -> bool:
+    """
+    Strict detection for Boario Impianti S.r.l.
+
+    Old version matched generic Italian phrases like 'ordine di acquisto',
+    causing collisions with other Italian customers (e.g., Union Alpha).
+
+    We now require at least ONE strong Boario identifier.
+    """
     if not text:
         return False
+
     t = text.lower()
-    triggers = [
+
+    strong_triggers = [
         "boario impianti s.r.l",
         "boario impianti srl",
-        "ordine di acquisto",
         "bossico (bg)",
+        "via nazionale 24",
+        "24060 bossico",
     ]
-    return any(trig in t for trig in triggers)
+
+    return any(trig in t for trig in strong_triggers)
+
+
+def _nf(s: str) -> str:
+    s = (s or "").strip()
+    return s if s else "Not found"
 
 
 def _extract_po_number(text: str) -> str:
@@ -20,20 +38,19 @@ def _extract_po_number(text: str) -> str:
         text,
         flags=re.I,
     )
-    return m.group(1).strip() if m else ""
+    return _nf(m.group(1).strip() if m else "")
 
 
 def _extract_po_date(text: str) -> str:
     m = re.search(r"Data\s*[:\-]?\s*(\d{2}\/\d{2}\/\d{4})", text, flags=re.I)
     if not m:
-        return ""
-    d = m.group(1)
-    return d.replace("/", ".")
+        return "Not found"
+    return m.group(1).replace("/", ".")
 
 
 def _extract_buyer(text: str) -> str:
     m = re.search(r"Rif\.\s*([A-Za-z ]+)", text, flags=re.I)
-    return m.group(1).strip() if m else ""
+    return _nf(m.group(1).strip() if m else "")
 
 
 def _extract_delivery_address(text: str) -> str:
@@ -42,12 +59,16 @@ def _extract_delivery_address(text: str) -> str:
     )
     if m:
         block = m.group(1)
-        return " ".join(ln.strip() for ln in block.splitlines() if ln.strip())
+        addr = " ".join(ln.strip() for ln in block.splitlines() if ln.strip())
+        return _nf(addr)
     return "Boario Impianti S.r.l., Via Nazionale 24, 24060 Bossico (BG), Italy"
 
 
 def _to_float_eu(num: str) -> float:
-    return float(num.replace(".", "").replace(",", "."))
+    try:
+        return float(num.replace(".", "").replace(",", "."))
+    except Exception:
+        return 0.0
 
 
 def _extract_lines(text: str):
@@ -85,8 +106,8 @@ def _extract_lines(text: str):
             "uom": uom,
             "price": price,
             "line_value": total,
-            "te_part_number": "",
-            "manufacturer_part_no": "",
+            "te_part_number": "Not found",
+            "manufacturer_part_no": "Not found",
             "delivery_date": delivery_date,
         })
 
