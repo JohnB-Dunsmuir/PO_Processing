@@ -1,0 +1,18 @@
+[INFO] PDF: PO_29039309.pdf
+[INFO] Extracted chars: 16995
+[INFO] Text head(200): 'Page | 1 of 5\nCOVER LETTER\nPURCHASE ORDER\nORDER DE COMPRA\nNEW\nORDER / N ° ORDEN : 29039309REV#:0\nPAGE / PAGINA : 2/5\nAPPROVED DATE / FECHA : 08-JAN-26\nBUYER NAME / COMPRADOR : RocireneHerrera\nTELEPHON'
+[INFO] Loaded parser modules: 74
+[INFO] Detected parser module: Parsers.parser_medical_po_29039309
+
+=== HEADER CHECK ===
+- po_number: 29039309 OK
+- po_date: 08-JAN-26 OK
+- customer_name: Medical Customer (Bilingual PO) OK
+- buyer: Rocirene Herrera OK
+- delivery_address: TE Connectivity (address not extracted) OK
+
+=== LINES CHECK ===
+- lines_count: 1
+- first_line: {'item_no': '1', 'customer_product_no': 'Not found', 'te_part_number': 'Not found', 'manufacturer_part_no': 'Not found', 'description': 'Not found', 'quantity': '1', 'uom': 'EA'}
+
+[PASS] Parser output looks Extractor-safe.
