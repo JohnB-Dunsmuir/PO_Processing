@@ -1,193 +1,147 @@
 # streamlit_app.py
-# Robust Streamlit front-end for PO_Processing V12 (Windows/OneDrive-safe)
-#
-# What this version fixes:
-# - Never crashes if OneDrive races (files disappear between glob/copy)
-# - Never crashes if Excel locks output files (safe temp copies for download)
-# - Minimal logic: upload PDFs -> run engine -> build Extractor output -> download
-#
-# Requirements:
-# - engine.V12_parser_engine.process_all_pdfs
-# - build_extractor_output.build_extractor_output
-# - Master Data at ./03_Master_Data/Master Data.xlsx
+# FINAL – Ship to (or Ship to ID) authoritative for parser + extractor
 
 from __future__ import annotations
-
+import re
 import shutil
 from datetime import datetime
 from pathlib import Path
+
 import streamlit as st
 import pandas as pd
 
-from engine.V12_parser_engine import process_all_pdfs
+from run_v12_wrapper_stdout import run_v12_wrapper_stdout
 from build_extractor_output import build_extractor_output
 
 BASE = Path(__file__).resolve().parent
 DIR_PDFS = BASE / "01_PDFs"
-DIR_ARCHIVE = BASE / "04_Archive"
 DIR_PARSED = BASE / "02_Parsed_Data"
-DIR_TEMP = BASE / "00_Temp_Downloads"
+DIR_ARCHIVE = BASE / "04_Archive"
 
 MASTER_PATH = BASE / "03_Master_Data" / "Master Data.xlsx"
 PARSED_XLSX = BASE / "Parsed_PO_Lines.xlsx"
 OUT_XLSX = DIR_PARSED / "Extractor_Output.xlsx"
 OUT_CSV = DIR_PARSED / "Extractor_Output.csv"
+FORCED_CSV = DIR_PARSED / "forced_parsers.csv"
 
+SHIP_TO_PATTERNS = [
+    re.compile(r"^\d{8}$"),
+    re.compile(r"^\d{10}\*D$"),
+]
 
-def backup_existing_pdfs() -> None:
-    """Move existing PDFs out of 01_PDFs without ever crashing (OneDrive-safe)."""
-    DIR_PDFS.mkdir(parents=True, exist_ok=True)
-    DIR_ARCHIVE.mkdir(parents=True, exist_ok=True)
+def pick_col_ci(df: pd.DataFrame, *candidates: str) -> str:
+    for cand in candidates:
+        for c in df.columns:
+            if c.strip().lower() == cand.strip().lower():
+                return c
+    raise KeyError(f"None of columns found: {candidates}")
 
-    pdfs = list(DIR_PDFS.glob("*.pdf")) + list(DIR_PDFS.glob("*.PDF"))
-    if not pdfs:
-        return
+@st.cache_data
+def load_master():
+    return pd.read_excel(MASTER_PATH, dtype=str).fillna("")
 
+def backup_existing_pdfs():
+    DIR_PDFS.mkdir(exist_ok=True)
+    DIR_ARCHIVE.mkdir(exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    dest = DIR_ARCHIVE / f"streamlit_backup_{ts}"
-    dest.mkdir(parents=True, exist_ok=True)
+    dest = DIR_ARCHIVE / f"backup_{ts}"
+    dest.mkdir()
+    for p in DIR_PDFS.glob("*.pdf"):
+        shutil.move(str(p), dest / p.name)
 
-    for p in pdfs:
-        try:
-            if not p.exists():
-                continue
-            try:
-                shutil.move(str(p), str(dest / p.name))
-            except Exception:
-                # fallback copy
-                try:
-                    shutil.copy2(str(p), str(dest / p.name))
-                    try:
-                        p.unlink()
-                    except Exception:
-                        pass
-                except Exception:
-                    continue
-        except Exception:
+def write_uploaded_pdfs(files):
+    DIR_PDFS.mkdir(exist_ok=True)
+    for f in files:
+        (DIR_PDFS / f.name).write_bytes(f.getbuffer())
+
+st.set_page_config(layout="wide")
+st.title("PO Processing – Ship-to Controlled")
+
+df_master = load_master()
+
+# Resolve Master columns ONCE
+SHIP_TO_COL = pick_col_ci(df_master, "Ship to ID", "Ship to")
+PARSER_COL = pick_col_ci(df_master, "Parser Used")
+
+uploaded = st.file_uploader("Upload PO PDFs", type=["pdf"], accept_multiple_files=True)
+
+rows = []
+errors = []
+
+if uploaded:
+    st.subheader("Ship to per PDF")
+
+    for f in uploaded:
+        ship_to = st.text_input(f"{f.name} – Ship to").strip()
+
+        if not any(p.match(ship_to) for p in SHIP_TO_PATTERNS):
+            errors.append(f.name)
+            st.error("Invalid Ship to format")
             continue
 
-
-def write_uploaded_pdfs(uploaded_files) -> None:
-    DIR_PDFS.mkdir(parents=True, exist_ok=True)
-    for f in uploaded_files:
-        try:
-            (DIR_PDFS / f.name).write_bytes(f.getbuffer())
-        except Exception:
+        m = df_master[df_master[SHIP_TO_COL] == ship_to]
+        if m.empty:
+            errors.append(f.name)
+            st.error("Ship to not found in Master Data")
             continue
 
+        parser_used = m.iloc[0][PARSER_COL]
 
-def file_bytes_safe(path: Path) -> bytes:
-    """Read bytes even if Excel/OneDrive locks the file."""
-    try:
-        return path.read_bytes()
-    except Exception:
-        DIR_TEMP.mkdir(parents=True, exist_ok=True)
-        tmp = DIR_TEMP / f"{path.stem}_download{path.suffix}"
-        try:
-            shutil.copy2(path, tmp)
-            return tmp.read_bytes()
-        except Exception:
-            return b""
+        rows.append({
+            "SourceFile": f.name,
+            "Ship to ID": ship_to,
+            "Parser Used": parser_used,
+        })
 
+        st.success(f"OK → {parser_used}")
 
-# ---------------- Streamlit UI ----------------
-
-st.set_page_config(page_title="PO Processing (V12)", layout="wide")
-st.title("PO Processing (V12) — SAP Extractor")
-
-st.caption(
-    "Upload PO PDFs, run parsers, and download SAP-ready Extractor output "
-    "(TE standing data applied)."
-)
-
-with st.sidebar:
-    st.header("Status")
-    st.write(f"Master Data: `{MASTER_PATH.relative_to(BASE)}`")
-    st.write("Master Data found ✅" if MASTER_PATH.exists() else "Master Data missing ❌")
-    st.write(f"PDF folder: `{DIR_PDFS.relative_to(BASE)}`")
-    st.write(f"Output: `{OUT_XLSX.relative_to(BASE)}`")
-
-st.subheader("1) Upload PDFs")
-uploaded = st.file_uploader(
-    "Select one or more PO PDFs",
-    type=["pdf", "PDF"],
-    accept_multiple_files=True,
-)
-
-run = st.button(
-    "Run parsers + build Extractor output",
-    type="primary",
-    disabled=(not uploaded or not MASTER_PATH.exists()),
-)
+run = st.button("Run", disabled=bool(errors) or not uploaded)
 
 if run:
-    st.info("Preparing input folder...")
     backup_existing_pdfs()
     write_uploaded_pdfs(uploaded)
+    DIR_PARSED.mkdir(exist_ok=True)
 
-    st.info("Running parser engine...")
-    process_all_pdfs()
+    # Persist Ship to + parser mapping
+    pd.DataFrame(rows).to_csv(FORCED_CSV, index=False)
 
-    if not PARSED_XLSX.exists():
-        st.error("Parsed_PO_Lines.xlsx was not created. Check logs.")
-    else:
-        st.success("Parsed output created.")
+    parsed_rows = []
 
-    st.info("Building SAP Extractor output...")
-    try:
-        build_extractor_output(
-            parsed_path=PARSED_XLSX,
-            master_path=MASTER_PATH,
-            out_xlsx=OUT_XLSX,
-            out_csv=OUT_CSV,
-            csv_sep=";",
-            unit_default=1,
+    for r in rows:
+        pdf = DIR_PDFS / r["SourceFile"]
+
+        result = run_v12_wrapper_stdout(
+            pdf_path=str(pdf),
+            parser_override=r["Parser Used"],  # authoritative
+            stdout=True,
         )
-        st.success("Extractor output created.")
-    except Exception as e:
-        st.exception(e)
 
-st.subheader("2) Download outputs")
+        for line in result["lines"]:
+            parsed_rows.append({
+                "SourceFile": pdf.name,
+                **result["header"],
+                **line,
+            })
 
-c1, c2, c3 = st.columns(3)
+    pd.DataFrame(parsed_rows).to_excel(PARSED_XLSX, index=False)
 
-with c1:
-    if PARSED_XLSX.exists():
-        st.download_button(
-            "Download Parsed_PO_Lines.xlsx",
-            data=file_bytes_safe(PARSED_XLSX),
-            file_name=PARSED_XLSX.name,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-    else:
-        st.write("Parsed output not present.")
+    build_extractor_output(
+        parsed_path=PARSED_XLSX,
+        master_path=MASTER_PATH,
+        out_xlsx=OUT_XLSX,
+        out_csv=OUT_CSV,
+        csv_sep=";",
+        unit_default=1,
+    )
 
-with c2:
-    if OUT_XLSX.exists():
-        st.download_button(
-            "Download Extractor_Output.xlsx",
-            data=file_bytes_safe(OUT_XLSX),
-            file_name=OUT_XLSX.name,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-    else:
-        st.write("Extractor output not present.")
+    st.success("Extraction complete")
 
-with c3:
-    if OUT_CSV.exists():
-        st.download_button(
-            "Download Extractor_Output.csv",
-            data=file_bytes_safe(OUT_CSV),
-            file_name=OUT_CSV.name,
-            mime="text/csv",
-        )
-    else:
-        st.write("Extractor CSV not present.")
+st.subheader("Downloads")
 
-st.subheader("3) Preview")
-if OUT_XLSX.exists():
-    try:
-        df_prev = pd.read_excel(OUT_XLSX, dtype=str).fillna("")
-        st.dataframe(df_prev.head(50), use_container_width=True)
-    except Exception as e:
-        st.warning(f"Preview failed: {e}")
+for label, path, mime in [
+    ("Parsed_PO_Lines.xlsx", PARSED_XLSX, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+    ("Extractor_Output.xlsx", OUT_XLSX, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+    ("Extractor_Output.csv", OUT_CSV, "text/csv"),
+]:
+    if path.exists():
+        st.download_button(label, path.read_bytes(), label, mime)
