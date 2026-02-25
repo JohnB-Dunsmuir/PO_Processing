@@ -22,3 +22,13 @@ streamlit_appold.py
 # Python
 __pycache__/
 *.pyc
+# Output folders
+00_logs/
+01_PDFs/
+02_Parsed_Data/
+03_Master_Data/
+04_Archive/
+05_Todays_Output/
+06_Historic_Output_Files/
+data_outputs/
+debug_tools/
