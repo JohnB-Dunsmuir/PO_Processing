@@ -1,3 +1,4 @@
+print("NEW BR PARSER ACTIVE")
 import re
 from typing import Dict, List, Any, Optional
 
@@ -29,7 +30,6 @@ def _find_first(patterns, text: str, flags=0) -> Optional[str]:
     for pat in patterns:
         m = re.search(pat, text, flags)
         if m:
-            # prefer captured group if present
             if m.lastindex:
                 return m.group(m.lastindex).strip()
             return m.group(0).strip()
@@ -46,48 +46,93 @@ def _norm_qty(x: str) -> str:
     return s.replace(",", ".")
 
 
-def _extract_address_block(text: str) -> Optional[str]:
-    """
-    Look for common delivery anchors and grab the following 1-6 lines,
-    stopping at a clear delimiter (Liefertermin, Liefertermin Tag, Seite, Page, Rechnung, Invoice).
-    Return cleaned address or None.
-    """
-    anchors = [
-        r"Bitte liefern Sie an\s*:\s*",
-        r"Bitte liefern Sie\s*:\s*",
-        r"Please deliver to\s*:\s*",
-        r"Deliver(?:y)?\s*To\s*:\s*",
-        r"Lieferadresse\s*[:\-]?\s*",
-        r"Ship To\s*:\s*",
-    ]
+# ---------------------------------------------------
+# ITEM BLOCK ISOLATION
+# ---------------------------------------------------
 
-    # Build a combined regex to find an anchor and capture the following block (up to 6 lines)
-    for a in anchors:
-        pat = re.compile(a + r"(?P<block>.*?)(?:\n\s*\n|Liefertermin\b|Liefertermin Tag\b|Liefertermin|Seite\b|Page\b|Rechnung\b|Invoice\b|Unsere UStIdentNummer\b|Bestellnummer\b)", re.IGNORECASE | re.DOTALL)
-        m = pat.search(text)
-        if m:
-            raw = m.group("block")
-            # keep up to 6 non-empty lines
-            lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
-            if not lines:
-                continue
-            lines = lines[:6]
-            return _clean_ws("\n".join(lines))
+def _isolate_item_block(text: str) -> str:
+    start = re.search(r"Pos\.\s+Material", text, flags=re.IGNORECASE)
+    if not start:
+        return text
 
-    # Fallback: scan for a block that contains "B&R Industrial Automation" and some address lines nearby
-    m2 = re.search(r"(B&R Industrial Automation GmbH.*?)(?:\n\s*\n|Liefertermin\b|Seite\b|Page\b)", text, flags=re.IGNORECASE | re.DOTALL)
-    if m2:
-        return _clean_ws(m2.group(1))
+    block = text[start.end():]
 
-    return None
+    end = re.search(
+        r"(Herstellerteilenummer|Ihre Materialnummer|Seite\s*/|\bPage\b)",
+        block,
+        flags=re.IGNORECASE,
+    )
+    if end:
+        block = block[:end.start()]
+
+    return block
 
 
-def _parse_lines(text: str) -> List[Dict[str, Any]]:
+# ---------------------------------------------------
+# VARIANT B – INLINE LAYOUT
+# ---------------------------------------------------
+
+def _extract_variant_b(text: str) -> List[Dict[str, Any]]:
+    rows = []
+    block = _isolate_item_block(text)
+
+    lines = [l.strip() for l in block.splitlines() if l.strip()]
+
+    buffer = ""
+
+    for line in lines:
+
+        if re.match(r"^\d{5}\s+[A-Z0-9\.\-]+", line):
+            if buffer:
+                parsed = _parse_inline_row(buffer)
+                if parsed:
+                    rows.append(parsed)
+            buffer = line
+        else:
+            buffer += " " + line
+
+        if "Stück" in buffer:
+            parsed = _parse_inline_row(buffer)
+            if parsed:
+                rows.append(parsed)
+            buffer = ""
+
+    if buffer:
+        parsed = _parse_inline_row(buffer)
+        if parsed:
+            rows.append(parsed)
+
+    return rows
+
+
+def _parse_inline_row(line: str) -> Optional[Dict[str, Any]]:
+    tokens = line.split()
+
+    try:
+        item_no = tokens[0]
+        material = tokens[1]
+
+        uom_idx = next(i for i, t in enumerate(tokens) if t.lower() == "stück")
+
+        qty = _norm_qty(tokens[uom_idx - 1])
+        description = " ".join(tokens[2:uom_idx - 1])
+
+        return {
+            "item_no": item_no,
+            "te_part_number": material,
+            "description": description if description else material,
+            "quantity": qty,
+            "uom": "ST",
+        }
+
+    except Exception:
+        return None# ---------------------------------------------------
+# ORIGINAL VARIANT A – TWO-LINE LAYOUT (UNCHANGED)
+# ---------------------------------------------------
+
+def _extract_variant_a(text: str) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
 
-    # Attempt to capture lines that look like:
-    # 00010 050002708-H01 3-5353652-6(18 TRAY)TE
-    #  1.008 Stück 4.753,00/1.000 4.791,02
     pat = re.compile(
         r"^\s*(?P<item>\d{5})\s+(?P<mat>[A-Z0-9\-]+)\s+(?P<tail>.+?)\s*$"
         r"(?:\r?\n|\r)\s*(?P<qty>\d{1,3}(?:[.,]\d{3})*(?:[.,]\d+)?)\s+Stück\b",
@@ -100,8 +145,12 @@ def _parse_lines(text: str) -> List[Dict[str, Any]]:
         tail = _clean_ws(m.group("tail"))
         qty = _norm_qty(m.group("qty"))
 
-        # Look for TE-like code in tail (e.g., 3-5353652-6)
-        te = _find_first([r"\b\d-\d{6,}-\d\b", r"\b[0-9]{1}-[0-9]{3,}-[0-9]\b", r"\b[0-9\-]{6,}\b"], tail, flags=re.IGNORECASE)
+        te = _find_first(
+            [r"\b\d-\d{6,}-\d\b", r"\b[0-9]{1}-[0-9]{3,}-[0-9]\b", r"\b[0-9\-]{6,}\b"],
+            tail,
+            flags=re.IGNORECASE,
+        )
+
         te_part = te if te else mat
 
         rows.append({
@@ -112,11 +161,32 @@ def _parse_lines(text: str) -> List[Dict[str, Any]]:
             "uom": "ST",
         })
 
-    if rows:
-        return rows
+    return rows
 
-    # Fallback: if TE code present anywhere, create single row
-    te2 = _find_first([r"\b\d-\d{6,}-\d\b", r"\b[0-9]{3,}-[0-9]{1,}\b"], text, flags=re.IGNORECASE)
+
+# ---------------------------------------------------
+# MASTER LINE PARSER
+# ---------------------------------------------------
+
+def _parse_lines(text: str) -> List[Dict[str, Any]]:
+
+    # Try Variant B first
+    rows_b = _extract_variant_b(text)
+    if rows_b:
+        return rows_b
+
+    # Fallback to Variant A
+    rows_a = _extract_variant_a(text)
+    if rows_a:
+        return rows_a
+
+    # Final fallback TE detection
+    te2 = _find_first(
+        [r"\b\d-\d{6,}-\d\b", r"\b[0-9]{3,}-[0-9]{1,}\b"],
+        text,
+        flags=re.IGNORECASE,
+    )
+
     if te2:
         return [{
             "item_no": "1",
@@ -135,6 +205,10 @@ def _parse_lines(text: str) -> List[Dict[str, Any]]:
     }]
 
 
+# ---------------------------------------------------
+# MAIN PARSER
+# ---------------------------------------------------
+
 def parse_br_industrial_automation(text: str) -> Dict[str, Any]:
     header = {
         "po_number": "Not found",
@@ -147,8 +221,12 @@ def parse_br_industrial_automation(text: str) -> Dict[str, Any]:
     if not text:
         return {"header": header, "lines": []}
 
-    # PO number/date
-    po_m = re.search(r"Bestellnummer/Datum\s*([0-9]+)\s*/\s*(\d{2}\.\d{2}\.\d{4})", text, flags=re.IGNORECASE)
+    po_m = re.search(
+        r"Bestellnummer/Datum\s*([0-9]+)\s*/\s*(\d{2}\.\d{2}\.\d{4})",
+        text,
+        flags=re.IGNORECASE,
+    )
+
     if po_m:
         header["po_number"] = _nf(po_m.group(1))
         header["po_date"] = _nf(po_m.group(2))
@@ -156,21 +234,19 @@ def parse_br_industrial_automation(text: str) -> Dict[str, Any]:
         header["po_number"] = _nf(_find_first([r"\b(45\d{8,})\b"], text, flags=re.IGNORECASE))
         header["po_date"] = _nf(_find_first([r"\b(\d{2}\.\d{2}\.\d{4})\b"], text, flags=re.IGNORECASE))
 
-    # Buyer
     header["buyer"] = _nf(_find_first([r"AnsprechpartnerIn/Telefon\s*([^\n\r]+)"], text, flags=re.IGNORECASE))
 
-    # Delivery address — improved extraction
-    addr = _extract_address_block(text)
-    if addr:
-        header["delivery_address"] = _nf(addr)
-    else:
-        # As a last attempt, capture the vendor address lines near "B&R Industrial Automation" block
-        addr2 = _find_first([r"(B&R Industrial Automation GmbH.*?ÖSTERREICH)", r"(B&R Industrial Automation GmbH.*?Eggelsberg)"], text, flags=re.IGNORECASE | re.DOTALL)
-        header["delivery_address"] = _nf(addr2)
+    addr = _find_first(
+        [r"(B&R Industrial Automation GmbH.*?ÖSTERREICH)",
+         r"(B&R Industrial Automation GmbH.*?Eggelsberg)"],
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    header["delivery_address"] = _nf(addr)
 
     lines = _parse_lines(text)
 
-    # ensure required header keys are present
     for k in REQUIRED_HEADER_KEYS:
         header[k] = _nf(header.get(k))
 
