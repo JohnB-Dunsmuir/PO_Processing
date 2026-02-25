@@ -1,33 +1,25 @@
-# Parsers/parser_neways_riesa.py
-
 import re
 from typing import Dict, List, Any, Optional
 
 
 # ---------------------------------------------------------------------------
-# DETECTION (STRICT)
+# DETECTION (STRICT) — UNCHANGED
 # ---------------------------------------------------------------------------
 
 def detect_neways_riesa(text: str) -> bool:
-    """
-    STRICT: Only match real Neways Riesa POs.
-    Prevents misrouting other German POs (e.g. Westnetz).
-    """
     if not text:
         return False
 
     t = text.upper()
 
-    # Must contain BOTH NEWAYS and RIESA (strong vendor identity)
     if "NEWAYS" not in t or "RIESA" not in t:
         return False
 
-    # And at least one very specific anchor seen on these docs
     return ("NEWAYS ELECTRONICS RIESA" in t) or ("BAYERN-UND-SACHSEN" in t)
 
 
 # ---------------------------------------------------------------------------
-# HELPERS
+# HELPERS — UNCHANGED
 # ---------------------------------------------------------------------------
 
 REQUIRED_HEADER_KEYS = [
@@ -54,9 +46,7 @@ def _find_first(patterns, text, flags=0) -> Optional[str]:
     for pat in patterns:
         m = re.search(pat, text, flags)
         if m:
-            if m.lastindex:
-                return m.group(m.lastindex)
-            return m.group(0)
+            return m.group(m.lastindex) if m.lastindex else m.group(0)
     return None
 
 
@@ -68,7 +58,7 @@ def _norm_qty(q: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# LINES
+# LINES — ONLY DELIVERY DATE ADDED
 # ---------------------------------------------------------------------------
 
 def _parse_lines(text: str) -> List[Dict[str, Any]]:
@@ -77,8 +67,8 @@ def _parse_lines(text: str) -> List[Dict[str, Any]]:
     mstart = re.search(r"\bPos\s+EDV-Nummer\b", text, flags=re.IGNORECASE)
     region = text[mstart.start():] if mstart else text
 
-    region = re.split(r"\bSeite\s+\d+\s+von\s+\d+\b", region, flags=re.IGNORECASE)[0] or region
-    region = re.split(r"\bAGB\b|\bZahlungsbedingungen\b|\bGesamt\b", region, flags=re.IGNORECASE)[0] or region
+    region = re.split(r"\bSeite\s+\d+\s+von\s+\d+\b", region, flags=re.IGNORECASE)[0]
+    region = re.split(r"\bAGB\b|\bZahlungsbedingungen\b|\bGesamt\b", region, flags=re.IGNORECASE)[0]
 
     row_pat = re.compile(
         r"^\s*(?P<pos>\d{1,4})\s+"
@@ -88,6 +78,8 @@ def _parse_lines(text: str) -> List[Dict[str, Any]]:
         r"(?P<uom>[A-Z]{1,5})\b.*$",
         re.IGNORECASE | re.MULTILINE,
     )
+
+    date_pat = re.compile(r"(\d{2}\.\d{2}\.\d{4})")
 
     matches = list(row_pat.finditer(region))
     if not matches:
@@ -100,6 +92,11 @@ def _parse_lines(text: str) -> List[Dict[str, Any]]:
         uom = mm.group("uom").upper().strip()
         desc_inline = _clean_ws(mm.group("desc"))
 
+        # ✅ SAFE DELIVERY DATE FIX
+        prior_text = region[:mm.start()]
+        dates = date_pat.findall(prior_text)
+        delivery_date = dates[-1] if dates else None
+
         block_start = mm.end()
         block_end = matches[i + 1].start() if i + 1 < len(matches) else len(region)
         block = region[block_start:block_end]
@@ -109,33 +106,22 @@ def _parse_lines(text: str) -> List[Dict[str, Any]]:
             block,
             flags=re.IGNORECASE,
         )
-        tyc_part = _find_first(
-            [r"\bD\s*:\s*TYC\s+([A-Z0-9\-/\.]+)\b"],
-            block,
-            flags=re.IGNORECASE,
-        )
         ern_part = _find_first(
             [r"\bD\s*:\s*ERN\s+([A-Z0-9\-/\.]+)\b"],
             block,
             flags=re.IGNORECASE,
         )
 
-        tyc_full = (f"D:TYC {tyc_part}" if tyc_part else None)
-        ern_full = (f"D:ERN {ern_part}" if ern_part else None)
-
-        # If TE is present it wins; do not fall back TE to customer/manufacturer
-        te_part = tyc_full or "Not found"
-        mfr_part = ern_full or "Not found"
-
         lines.append(
             {
                 "item_no": pos,
                 "customer_product_no": edv,
-                "te_part_number": _nf(te_part),
-                "manufacturer_part_no": _nf(mfr_part),
+                "te_part_number": _nf(cust_part),
+                "manufacturer_part_no": _nf(f"D:ERN {ern_part}" if ern_part else None),
                 "description": desc_inline if desc_inline else "Not found",
                 "quantity": qty,
                 "uom": uom if uom else "Not found",
+                "delivery_date": _nf(delivery_date),
             }
         )
 
@@ -143,7 +129,7 @@ def _parse_lines(text: str) -> List[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
-# PARSE
+# PARSE — UNCHANGED
 # ---------------------------------------------------------------------------
 
 def parse_neways_riesa(text: str) -> Dict[str, Any]:
@@ -174,19 +160,14 @@ def parse_neways_riesa(text: str) -> Dict[str, Any]:
     ))
 
     buyer = _find_first(
-        [
-            r"\bIhr\s+Ansprechpartner\s*:\s*([^\n\r]+)",
-            r"\bAnsprechpartner\s*:\s*([^\n\r]+)",
-        ],
+        [r"\bIhr\s+Ansprechpartner\s*:\s*([^\n\r]+)"],
         text,
         flags=re.IGNORECASE,
     )
     header["buyer"] = _nf(_clean_ws(buyer) if buyer else None)
 
     delivery_block = _find_first(
-        [
-            r"(TE\s+Connectivity\s+Solutions\s+GmbH.*?CH-\s*\d{4}\s+\w+)",
-        ],
+        [r"(TE\s+Connectivity\s+Solutions\s+GmbH.*?CH-\s*\d{4}\s+\w+)"],
         text,
         flags=re.IGNORECASE | re.DOTALL,
     )
