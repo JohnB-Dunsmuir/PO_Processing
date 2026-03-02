@@ -10,6 +10,10 @@ from pathlib import Path
 import streamlit as st
 import pandas as pd
 
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+
 from run_v12_wrapper_stdout import run_v12_wrapper_stdout
 from build_extractor_output import build_extractor_output
 
