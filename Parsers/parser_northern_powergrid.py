@@ -1,3 +1,47 @@
+import re
+from typing import Dict, List, Any, Optional
+
+
+# ---------------------------------------------------------------------------
+# DETECT
+# ---------------------------------------------------------------------------
+
+def detect_northern_powergrid(text: str) -> bool:
+    if not text:
+        return False
+    t = text.upper()
+    return "NORTHERN POWERGRID" in t
+
+
+# ---------------------------------------------------------------------------
+# HEADER HELPERS
+# ---------------------------------------------------------------------------
+
+REQUIRED_HEADER_KEYS = [
+    "po_number",
+    "po_date",
+    "customer_name",
+    "buyer",
+    "delivery_address",
+]
+
+
+def _nf(v: Optional[str]) -> str:
+    if v is None:
+        return "Not found"
+    s = str(v).strip()
+    return s if s else "Not found"
+
+
+def _find_first(pattern: str, text: str, flags=0) -> Optional[str]:
+    m = re.search(pattern, text, flags)
+    return m.group(1) if m else None
+
+
+# ---------------------------------------------------------------------------
+# LINES (YOUR ORIGINAL LOGIC — UNCHANGED)
+# ---------------------------------------------------------------------------
+
 def _extract_lines(text: str):
     lines = text.splitlines()
     results = []
@@ -6,8 +50,6 @@ def _extract_lines(text: str):
     while i < len(lines):
         line = lines[i].strip()
 
-        # Match main item row:
-        # 35 163664 Needed: 15 EACH 94 N 1,410.00
         m = re.match(
             r"^(\d+)\s+(\d+)\s+Needed:\s+(\d+)\s+([A-Z]+)\s+([\d,\.]+)\s+[A-Z]\s+([\d,\.]+)",
             line,
@@ -24,7 +66,6 @@ def _extract_lines(text: str):
             delivery_date = ""
             description_lines = []
 
-            # Next line = delivery date/time
             if i + 1 < len(lines):
                 dt_line = lines[i + 1].strip()
                 d = re.match(r"^(\d{2}-[A-Z]{3}-\d{4})", dt_line)
@@ -32,7 +73,6 @@ def _extract_lines(text: str):
                     delivery_date = d.group(1)
                     i += 1
 
-            # Collect description lines until next numeric item or "Total:"
             j = i + 1
             while j < len(lines):
                 next_line = lines[j].strip()
@@ -68,3 +108,37 @@ def _extract_lines(text: str):
         i += 1
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# PARSE (FRAMEWORK ENTRY POINT)
+# ---------------------------------------------------------------------------
+
+def parse_northern_powergrid(text: str) -> Dict[str, Any]:
+
+    header = {
+        "po_number": "Not found",
+        "po_date": "Not found",
+        "customer_name": "Northern Powergrid",
+        "buyer": "Not found",
+        "delivery_address": "Not found",
+    }
+
+    if not text:
+        return {"header": header, "lines": []}
+
+    # Basic PO number extraction (adjust if needed)
+    header["po_number"] = _nf(_find_first(r"\bPO\s*Number\s*[: ]\s*([A-Z0-9\-]+)", text, re.IGNORECASE))
+
+    # Basic date extraction (adjust if needed)
+    header["po_date"] = _nf(_find_first(r"\b(\d{2}-[A-Z]{3}-\d{4})\b", text))
+
+    lines = _extract_lines(text)
+
+    for k in REQUIRED_HEADER_KEYS:
+        header[k] = _nf(header.get(k))
+
+    return {
+        "header": header,
+        "lines": lines,
+    }

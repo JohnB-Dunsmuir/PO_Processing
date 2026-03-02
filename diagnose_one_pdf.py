@@ -92,14 +92,27 @@ def diagnose_one_pdf_wrapper(
 
     modules = load_parsers(parsers_dir)
 
+    # ---------------------------
+    # Forced parser selection (FIXED)
+    # ---------------------------
     if forced_parser:
         parse_fn = None
-        mod_name = forced_parser
+        mod_name = None
+
+        # forced_parser should be the module stem, e.g. "parser_northern_powergrid"
+        forced_norm = str(forced_parser).strip().lower()
+
         for name, mod in modules:
-            if name.endswith(forced_parser):
+            module_short_name = name.split(".")[-1].strip().lower()  # e.g. parser_northern_powergrid
+
+            if module_short_name == forced_norm:
                 parse_fns = [getattr(mod, fn) for fn in dir(mod) if fn.startswith("parse_")]
                 parse_fn = parse_fns[0] if parse_fns else None
+                mod_name = name
                 break
+
+        if parse_fn is None:
+            raise RuntimeError(f"Forced parser '{forced_parser}' not found.")
     else:
         mod_name, parse_fn = find_parser(modules, text)
 
@@ -151,7 +164,7 @@ def main():
         print(f"[ERROR] PDF not found: {pdf_path}")
         sys.exit(2)
 
-    result = diagnose_one_pdf_wrapper(pdf_path, stdout=True)
+    result = diagnose_one_pdf_wrapper(str(pdf_path), stdout=True)
 
     missing = [
         k for k in REQUIRED_HEADER_KEYS
